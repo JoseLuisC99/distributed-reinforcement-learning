@@ -1,0 +1,3 @@
+torch~=2.1.2
+gymnasium~=0.29.1
+tqdm~=4.66.1

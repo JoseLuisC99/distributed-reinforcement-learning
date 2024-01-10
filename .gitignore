@@ -1,0 +1,8 @@
+.idea
+.venv
+distrl.egg-info/
+bibliography
+notebooks/archive
+scripts/archive
+models/archive
+__pycache__
