@@ -12,9 +12,9 @@ from tqdm import tqdm
 class Policy(nn.Module):
     def __init__(self):
         super(Policy, self).__init__()
-        self.affine1 = nn.Linear(4, 128)
+        self.affine1 = nn.Linear(8, 256)
         self.dropout = nn.Dropout(p=0.6)
-        self.affine2 = nn.Linear(128, 2)
+        self.affine2 = nn.Linear(256, 4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.affine1(x)
@@ -38,8 +38,6 @@ if __name__ == '__main__':
     parser.add_argument("--master_port", type=str, default="29500",
                         help="Port that master is listening on, will default to 29500 if not provided. Master must be "
                              "able to accept network traffic on the host and port.")
-    parser.add_argument("--env_name", type=str, default="CartPole-v1",
-                        help="Name of the environment (see https://gymnasium.farama.org/).")
     parser.add_argument("--max_iters", type=int, default=10000,
                         help="Maximum number of iterations per period.")
     parser.add_argument("--max_episodes", type=int,
@@ -58,11 +56,11 @@ if __name__ == '__main__':
         server = ParameterServer(args.world_size, policy, max_episodes=args.max_episodes)
         server.run()
         if args.output_dir is not None:
-            torch.save(policy.state_dict(), os.path.join(args.output_dir, f"{args.env_name}_policy.pt"))
-            print("Policy model saved on", os.path.join(args.output_dir, f"{args.env_name}_policy.pt"))
+            torch.save(policy.state_dict(), os.path.join(args.output_dir, "LunarLander-v2_policy.pt"))
+            print("Policy model saved on", os.path.join(args.output_dir, "LunarLander-v2_policy.pt"))
     else:
         print(f"Worker {args.rank} started")
-        worker = DistAgent(args.rank, policy, args.env_name, args.max_iters, args.gamma)
+        worker = DistAgent(args.rank, policy, "LunarLander-v2", args.max_iters, args.gamma)
         for _ in tqdm(range(args.max_episodes)):
             worker.run_episode()
         print(f"Running reward of {args.rank}: {worker.running_reward:.4f}")

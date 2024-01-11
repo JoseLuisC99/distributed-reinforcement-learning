@@ -30,13 +30,23 @@ class ModelDistBuffer:
         return self.__parameter_buffer
 
 
-class DistAgent:
-    def __init__(self, rank: int,
-                 policy: nn.Module,
-                 env: str,
-                 max_iters: int,
-                 gamma: float,
+class Agent:
+    def __init__(self, policy: nn.Module, device: torch.device = torch.device("cpu")):
+        self.policy = policy
+        self._device = device
+
+    def act(self, state: np.ndarray):
+        state = torch.from_numpy(state).float().unsqueeze(0).to(self._device)
+        probs = self.policy(state)
+        m = Categorical(probs)
+        action = m.sample()
+        return action.item(), m.log_prob(action)
+
+
+class DistAgent(Agent):
+    def __init__(self, rank: int, policy: nn.Module, env: str, max_iters: int, gamma: float,
                  device: torch.device = torch.device("cpu")):
+        super().__init__(policy, device)
         self._rank = rank
         self._device = device
         self._max_iters = max_iters
@@ -65,12 +75,9 @@ class DistAgent:
             dist.gather(grad, dst=0)
 
     def select_action(self, state: np.ndarray):
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self._device)
-        probs = self.policy(state)
-        m = Categorical(probs)
-        action = m.sample()
-        self.__actions.append(m.log_prob(action))
-        return action.item()
+        action, log_prob = self.act(state)
+        self.__actions.append(log_prob)
+        return action
 
     def run_episode(self):
         logger.info(f"Running episode on worker {self._rank}.")
