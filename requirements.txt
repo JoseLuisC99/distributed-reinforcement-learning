@@ -3,3 +3,7 @@ gymnasium~=0.29.1
 tqdm~=4.66.1
 jupyter~=1.0.0
 pygame~=2.5.2
+moviepy~=1.0.3
+ffmpeg~=1.4
+matplotlib~=3.8.2
+PyQt5~=5.15.10
