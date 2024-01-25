@@ -4,21 +4,13 @@ import torch.distributed as dist
 from typing import Optional
 from itertools import count
 from functools import reduce
-import logging
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-
-
-logger = logging.getLogger("Server")
-logger.setLevel(logging.INFO)
 
 
 class ParameterServer:
     def __init__(self, world_size: int, policy: nn.Module, lr: float = 0.001, max_episodes: Optional[int] = None):
         self.policy = policy.to(torch.device("cpu"))
         self.running_reward = 0
-        self.__world_size = world_size
-        self.__workers = world_size - 1
         self.__optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
         self.__max_episodes = max_episodes
 
@@ -26,7 +18,7 @@ class ParameterServer:
         self.__worker_buffer = []
         for param in self.policy.parameters():
             worker_return = []
-            for _ in range(self.__world_size):
+            for _ in range(world_size):
                 worker_return.append(torch.empty(param.size()))
             self.__worker_buffer.append(worker_return)
             self.__gradients.append(torch.empty(param.size()))
@@ -51,19 +43,16 @@ class ParameterServer:
             param.grad = self.__gradients[idx]
         self.__optimizer.step()
 
-    def run(self):
-        logger.info("Server waiting for workers.")
+    def run(self, smoothing_factor: float = 0.9):
         iterator = range(self.__max_episodes) if self.__max_episodes is not None else count(1)
         running_reward_history = []
-        for episode in tqdm(iterator):
-            logger.info(f"Episode {episode}.")
+        for _ in tqdm(iterator):
             self.policy.train()
             self._broadcast_parameters()
             self._receive_gradients()
             self._update()
             min_reward = self._receive_rewards().item()
-            self.running_reward = 0.05 * min_reward + (1 - 0.05) * self.running_reward
-            running_reward_history.append(min_reward)
-        print(f"Global running reward: {self.running_reward:.3f}")
+            self.running_reward = (1 - smoothing_factor) * min_reward + smoothing_factor * self.running_reward
+            running_reward_history.append(self.running_reward)
 
         return running_reward_history

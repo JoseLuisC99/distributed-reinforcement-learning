@@ -1,6 +1,6 @@
 import os
-import csv
 import argparse
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -35,25 +35,24 @@ def run(rank: int, world_size: int, max_episodes: int, max_iters: int, gamma: fl
         print("Server started")
         policy = Policy()
         server = ParameterServer(world_size, policy, max_episodes=max_episodes)
-        history = server.run()
+        history = server.run(smoothing_factor=0.95)
+        print(f"Global running reward: {server.running_reward:.3f}")
         if output_dir is not None:
-            torch.save(policy.state_dict(), os.path.join(output_dir, f"{env_name}_policy.pt"))
-            print("Policy model saved on", os.path.join(output_dir, f"{env_name}_policy.pt"))
-
-            with open(os.path.join(output_dir, f"{env_name}.csv"), "a+") as f:
-                wr = csv.writer(f)
-                wr.writerow(history)
+            torch.save(policy.state_dict(), os.path.join(output_dir, f"{env_name}_{world_size - 1}workers_policy.pt"))
+            print("Policy model saved on", os.path.join(output_dir, f"{env_name}_{world_size - 1}workers_policy.pt"))
+        plt.plot(history)
+        plt.show()
     else:
         print(f"Worker {rank} started")
         policy = Policy()
-        worker = DistAgent(rank, policy, env_name, max_iters, gamma)
+        worker = DistAgent(policy, env_name, max_iters, gamma)
         for _ in range(max_episodes):
             worker.run_episode()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Distributed Reinforcement Learning Example")
-    parser.add_argument("--world_size", default=4, type=int,
+    parser.add_argument("--workers", default=4, type=int,
                         help="Number of workers.")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="How much to value future rewards.")
@@ -75,8 +74,8 @@ if __name__ == '__main__':
 
     mp.set_start_method("spawn")
     processes = []
-    for rank in range(args.world_size):
-        p = mp.Process(target=run, args=(rank, args.world_size, args.max_episodes, args.max_iters, args.gamma,
+    for rank in range(args.workers + 1):
+        p = mp.Process(target=run, args=(rank, args.workers + 1, args.max_episodes, args.max_iters, args.gamma,
                                          args.master_addr, args.master_port, args.env_name, args.output_dir))
         p.start()
         processes.append(p)

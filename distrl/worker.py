@@ -4,13 +4,7 @@ from torch import nn
 from torch.distributions import Categorical
 import torch.distributed as dist
 import gymnasium as gym
-import logging
 from collections import OrderedDict
-
-
-logger = logging.getLogger("Workers")
-logger.setLevel(logging.INFO)
-
 
 class Agent:
     def __init__(self, policy: nn.Module, device: torch.device = torch.device("cpu")):
@@ -26,10 +20,9 @@ class Agent:
 
 
 class DistAgent(Agent):
-    def __init__(self, rank: int, policy: nn.Module, env: str, max_iters: int, gamma: float,
+    def __init__(self, policy: nn.Module, env: str, max_iters: int, gamma: float,
                  device: torch.device = torch.device("cpu")):
         super().__init__(policy, device)
-        self._rank = rank
         self._device = device
         self._max_iters = max_iters
         self._gamma = gamma
@@ -73,8 +66,6 @@ class DistAgent(Agent):
         return action
 
     def run_episode(self):
-        logger.info(f"Running episode on worker {self._rank}.")
-
         self.update()
         state, _ = self.env.reset()
         for _ in range(self._max_iters):
@@ -105,5 +96,4 @@ class DistAgent(Agent):
         del self.__actions[:]
         del self.__rewards[:]
 
-        logger.info(f"Iteration on worker {self._rank}: reward {reward:.4f} | running_reward {self.running_reward:.4f}")
         self.send_reward(torch.tensor(reward))
