@@ -4,11 +4,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from distrl.server import ParameterServer
 from distrl.worker import DistAgent
 from tqdm import tqdm
-from typing import Optional
+import matplotlib.pyplot as plt
 
 
 class Policy(nn.Module):
@@ -24,25 +23,6 @@ class Policy(nn.Module):
         x = F.relu(x)
         action_scores = self.affine2(x)
         return F.softmax(action_scores, dim=1)
-
-
-def run_server(output_dir: Optional[str] = None):
-    print("Server started")
-    policy = Policy()
-    server = ParameterServer(args.world_size, policy, max_episodes=args.max_episodes)
-    server.run()
-    if output_dir is not None:
-        torch.save(policy.state_dict(), os.path.join(args.output_dir, "CartPole-v1_policy.pt"))
-        print("Policy model saved on", os.path.join(args.output_dir, "CartPole-v1_policy.pt"))
-
-
-def run_worker(rank: int, max_episodes: int, max_iters: int, gamma: float):
-    print(f"Worker {rank} started")
-    policy = Policy()
-    worker = DistAgent(rank, policy, "CartPole-v1", max_iters, gamma)
-    for _ in tqdm(range(max_episodes)):
-        worker.run_episode()
-    print(f"Running reward of {rank}: {worker.running_reward:.4f}")
 
 
 if __name__ == '__main__':
@@ -73,13 +53,18 @@ if __name__ == '__main__':
     os.environ["MASTER_PORT"] = args.master_port
     dist.init_process_group(backend='gloo', world_size=args.world_size, rank=args.rank)
 
-    mp.set_start_method("spawn")
-    processes = [mp.Process(target=run_server, args=(args.output_dir, ))]
-    processes[0].start()
-    for rank in range(1, args.world_size):
-        p = mp.Process(target=run_worker, args=(args.rank, args.max_episodes, args.max_iters, args.gamma))
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
+    if args.rank == 0:
+        policy = Policy()
+        server = ParameterServer(args.world_size, policy, max_episodes=args.max_episodes)
+        history = server.run(smoothing_factor=0.95)
+        print(f"Global running reward: {server.running_reward:.3f}")
+        if args.output_dir is not None:
+            torch.save(policy.state_dict(), os.path.join(args.output_dir, f"{args.env_name}_policy.pt"))
+            print("Policy model saved on", os.path.join(args.output_dir, f"{args.env_name}_policy.pt"))
+        plt.plot(history)
+        plt.show()
+    else:
+        policy = Policy()
+        worker = DistAgent(policy, args.env_name, args.max_iters, args.gamma)
+        for _ in tqdm(range(args.max_episodes)):
+            worker.run_episode()
