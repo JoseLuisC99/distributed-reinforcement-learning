@@ -6,3 +6,5 @@ notebooks/archive
 scripts/archive
 models/archive
 __pycache__
+notebooks/checkpoints
+models

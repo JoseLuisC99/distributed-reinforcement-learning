@@ -6,8 +6,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from distrl.server import ParameterServer
-from distrl.worker import DistAgent
+from distrl.policy_server.server import ParameterServer
+from distrl.policy_server.worker import DistAgent
 from typing import Optional
 
 
