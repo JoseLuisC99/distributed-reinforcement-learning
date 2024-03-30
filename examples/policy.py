@@ -56,7 +56,7 @@ if __name__ == '__main__':
                         help="Number of workers.")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="How much to value future rewards.")
-    parser.add_argument("--master_addr", type=str, default="localhost",
+    parser.add_argument("--master_addr", type=str, default="0.0.0.0",
                         help="Address of master, will default to localhost if not provided. Master must be able to "
                              "accept network traffic on the address + port.")
     parser.add_argument("--master_port", type=str, default="29500",

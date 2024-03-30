@@ -1,4 +1,4 @@
-torch~=2.1.2
+torch~=2.2.2
 gymnasium~=0.29.1
 tqdm~=4.66.1
 jupyter~=1.0.0
@@ -7,3 +7,6 @@ moviepy~=1.0.3
 ffmpeg~=1.4
 matplotlib~=3.8.2
 PyQt5~=5.15.10
+numpy~=1.26.4
+setuptools~=68.2.2
+gymnasium[atari, accept-rom-license, other]

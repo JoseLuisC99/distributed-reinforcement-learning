@@ -1,48 +1,52 @@
-import torch
-import numpy as np
+import threading
 from typing import Tuple, SupportsFloat
+
+import numpy as np
+import torch
 
 
 class MemoryReplay:
-    def __init__(self, n: int, state_dim: Tuple[int, ...], device: torch.device):
+    def __init__(self, n: int, state_dim: Tuple[int, ...]):
         self._n = n
-        self._size = 0
         self._next_index = 0
 
-        self._states = np.empty((n, *state_dim), dtype=np.float32)
-        self._actions = np.empty(n, dtype=np.int32)
-        self._rewards = np.empty(n, dtype=np.float32)
-        self._next_states = np.empty((n, *state_dim), dtype=np.float32)
-        self._terminals = np.empty(n, dtype=np.int32)
-        self._device = device
+        # TODO: add dtype option
+        self._states = torch.empty((n, *state_dim))
+        self._actions = torch.empty(n)
+        self._rewards = torch.empty(n)
+        self._next_states = torch.empty((n, *state_dim))
+        self._terminals = torch.empty(n)
+        self.__lock = threading.Lock()
 
     def push(self,
-             state: np.ndarray,
-             action: torch.Tensor,
+             state: torch.Tensor,
+             action: SupportsFloat,
              reward: SupportsFloat,
-             next_state: np.ndarray,
+             next_state: torch.Tensor,
              is_terminal: bool) -> None:
-        self._states[self._next_index] = state
-        self._actions[self._next_index] = action
-        self._rewards[self._next_index] = reward
-        self._next_states[self._next_index] = next_state
-        self._terminals[self._next_index] = is_terminal
-
-        self._next_index = (self._next_index + 1) % self._n
-        self._size = min(self._size + 1, self._n)
+        with self.__lock:
+            idx = self._next_index
+            self._next_index = (self._next_index + 1) % self._n
+            self._states[idx] = state
+            self._actions[idx] = float(action)
+            self._rewards[idx] = float(reward)
+            self._next_states[idx] = next_state
+            self._terminals[idx] = int(is_terminal)
 
     def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        indices = np.random.choice(range(self._size), batch_size)
-        return (
-            torch.FloatTensor(self._states[indices]).to(self._device),
-            torch.LongTensor(self._actions[indices]).to(self._device),
-            torch.FloatTensor(self._rewards[indices]).to(self._device),
-            torch.FloatTensor(self._next_states[indices]).to(self._device),
-            torch.LongTensor(self._terminals[indices]).to(self._device)
-        )
+        with self.__lock:
+            # TODO: add preprocessing step (although it is better to use gym.Wrapper)
+            indices = np.random.choice(range(self._n), batch_size)
+            return (
+                self._states[indices].type(torch.float32),
+                self._actions[indices],
+                self._rewards[indices],
+                self._next_states[indices].type(torch.float32),
+                self._terminals[indices]
+            )
 
     def __len__(self) -> int:
-        return self._size
+        return self._n
 
 
 class LinearAnnealer:

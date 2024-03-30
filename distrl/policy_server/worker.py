@@ -6,6 +6,7 @@ import torch.distributed as dist
 import gymnasium as gym
 from collections import OrderedDict
 
+
 class Agent:
     def __init__(self, policy: nn.Module, device: torch.device = torch.device("cpu")):
         self.policy = policy

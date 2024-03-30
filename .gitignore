@@ -3,7 +3,7 @@
 distrl.egg-info/
 bibliography
 notebooks/archive
-scripts/archive
+examples/archive
 models/archive
 __pycache__
 notebooks/checkpoints
