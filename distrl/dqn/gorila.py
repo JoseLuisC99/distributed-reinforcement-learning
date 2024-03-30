@@ -26,7 +26,7 @@ class ParameterServer:
         self._q_network = q_network
         self._target_network = copy.deepcopy(q_network)
         self.__version = 0
-        self._optimizer = optim.AdamW(self._q_network.parameters(), lr=lr, amsgrad=True)
+        self._optimizer = optim.AdamW(self._q_network.parameters(), lr=lr)
         self._max_version_difference = max_version_difference
         self._sync_frequency = sync_frequency
         self._checkpoint = checkpoint

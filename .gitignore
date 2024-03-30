@@ -8,3 +8,5 @@ models/archive
 __pycache__
 notebooks/checkpoints
 models
+checkpoints
+.ipynb_checkpoints

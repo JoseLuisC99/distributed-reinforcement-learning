@@ -96,13 +96,13 @@ def get_arguments() -> Namespace:
     args_parser.add_argument("--gamma",
                              type=float, default=0.99)
     args_parser.add_argument("--steps",
-                             type=int, default=10_000)
+                             type=int, default=20_000)
     args_parser.add_argument("--mem-size",
                              type=int, default=50_000)
     args_parser.add_argument("--learning-rate",
                              type=float, default=2e-4)
     args_parser.add_argument("--sync-freq",
-                             type=int, default=500)
+                             type=int, default=1_000)
     args_parser.add_argument("--max-version-diff",
                              type=int, default=10)
     args_parser.add_argument("--checkpoint",
