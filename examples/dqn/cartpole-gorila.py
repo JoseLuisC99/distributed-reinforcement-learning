@@ -10,6 +10,10 @@ from torch.distributed import rpc
 
 from distrl.dqn.gorila import ParameterServer, Learner, Actor, Coordinator
 from distrl.dqn.utils import MemoryReplay, LinearAnnealer
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 ps = None
 memory_buffer = None
@@ -20,7 +24,7 @@ learner = None
 def get_memory_buffer(retry: int = 5, max_attempts: int = 4):
     global memory_buffer
     while memory_buffer is None:
-        print(f"memory buffer not initialized, waiting for {retry}s")
+        logger.warning(f"memory buffer not initialized, waiting for {retry}s")
         time.sleep(retry)
         max_attempts -= 1
         if max_attempts <= 0:
@@ -31,7 +35,7 @@ def get_memory_buffer(retry: int = 5, max_attempts: int = 4):
 def get_actor(retry: int = 5, max_attempts: int = 4):
     global actor
     while actor is None:
-        print(f"actor not initialized, waiting for {retry}s")
+        logger.warning(f"actor not initialized, waiting for {retry}s")
         time.sleep(retry)
         max_attempts -= 1
         if max_attempts <= 0:
@@ -42,7 +46,7 @@ def get_actor(retry: int = 5, max_attempts: int = 4):
 def get_learner(retry: int = 5, max_attempts: int = 4):
     global learner
     while learner is None:
-        print(f"learner not initialized, waiting for {retry}s")
+        logger.warning(f"learner not initialized, waiting for {retry}s")
         time.sleep(retry)
         max_attempts -= 1
         if max_attempts <= 0:
@@ -53,7 +57,7 @@ def get_learner(retry: int = 5, max_attempts: int = 4):
 def get_ps(retry: int = 5, max_attempts: int = 4):
     global ps
     while ps is None:
-        print(f"parameter server not initialized, waiting for {retry}s")
+        logger.warning(f"parameter server not initialized, waiting for {retry}s")
         time.sleep(retry)
         max_attempts -= 1
         if max_attempts <= 0:
@@ -113,6 +117,8 @@ def get_arguments() -> Namespace:
                              dest="cuda", action="store_false")
     args_parser.add_argument("--output",
                              type=str, required=False, default=None)
+    args_parser.add_argument("--log",
+                             type=str, required=False, default="INFO")
 
     # Information about the other nodes
     args_parser.add_argument("--memory-rank",
@@ -130,11 +136,24 @@ def get_arguments() -> Namespace:
 if __name__ == "__main__":
     args = get_arguments()
 
+    if args.log is not None:
+        os.makedirs("logs", exist_ok=True)
+        log_level = getattr(logging, args.log.upper(), None)
+        if not isinstance(log_level, int):
+            raise ValueError(f"Invalid log level: {args.log}")
+        logging.basicConfig(
+            format="%(asctime)s - %(name)s - %(levelname)s: %(message)s",
+            filename=os.path.join("logs", f"{datetime.now().strftime('%Y-%m-%d %H:%M:00')}.log"),
+            encoding="utf-8",
+            level=log_level
+        )
+
     device = torch.device("cuda" if args.cuda else "cpu")
     if args.cuda and not torch.cuda.is_available():
-        print("Warning: CUDA device not available")
+        logger.error(f"CUDA device not available for node_{args.rank}")
     elif not args.cuda and torch.cuda.is_available():
         device = torch.device("cpu")
+    logger.info(f"using {device.type} device in node_{args.rank}")
 
     env = gym.make(args.env)
 
@@ -144,8 +163,6 @@ if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
     rpc.init_rpc(f"node_{args.rank}", rank=args.rank, world_size=args.world_size)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.node_type == "ps":
         ps = ParameterServer(
@@ -168,6 +185,7 @@ if __name__ == "__main__":
         rref_memory = rpc.remote(args.memory_rank, get_memory_buffer)
         annealer = LinearAnnealer(1.0, 0.1, args.steps)
         actor = Actor(
+            args.rank,
             env,
             rref_memory,
             rref_ps,
@@ -180,6 +198,7 @@ if __name__ == "__main__":
         rref_ps = rpc.remote(args.ps_rank, get_ps)
         rref_memory = rpc.remote(args.memory_rank, get_memory_buffer)
         learner = Learner(
+            args.rank,
             DeepQNetwork(observation_shape, action_space_dim),
             rref_ps,
             rref_memory,
@@ -189,6 +208,6 @@ if __name__ == "__main__":
         )
     elif args.node_type == "memory":
         memory_buffer = MemoryReplay(args.mem_size, (observation_shape, ))
-        print("memory buffer ready")
+        logger.debug("memory buffer ready")
 
     rpc.shutdown()

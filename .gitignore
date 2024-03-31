@@ -10,3 +10,4 @@ notebooks/checkpoints
 models
 checkpoints
 .ipynb_checkpoints
+logs
