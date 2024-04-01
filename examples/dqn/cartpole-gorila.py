@@ -1,17 +1,19 @@
+import logging
 import os
 import time
 from argparse import ArgumentParser, Namespace
+from datetime import datetime
+from typing import Literal
 
 import gymnasium as gym
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed import rpc
 
-from distrl.dqn.gorila import ParameterServer, Learner, Actor, Coordinator
+from distrl.dqn.gorila import ParameterServer, Learner, Actor
 from distrl.dqn.utils import MemoryReplay, LinearAnnealer
-import logging
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -80,19 +82,10 @@ class DeepQNetwork(nn.Module):
 
 def get_arguments() -> Namespace:
     args_parser = ArgumentParser(description="GORILA")
-    # RPC information
-    args_parser.add_argument("--rank",
-                             type=int, required=True)
-    args_parser.add_argument("--world-size",
-                             type=int, required=True)
-    args_parser.add_argument("--node-type",
-                             type=str, choices=["ps", "actor", "learner", "memory"], required=True)
     args_parser.add_argument("--master-addr",
                              type=str, default="localhost")
     args_parser.add_argument("--master-port",
                              type=int, default=8080)
-
-    # Runtime configuration
     args_parser.add_argument("--env",
                              type=str, default="CartPole-v1")
     args_parser.add_argument("--batch-size",
@@ -111,26 +104,102 @@ def get_arguments() -> Namespace:
                              type=int, default=10)
     args_parser.add_argument("--checkpoint",
                              type=bool, required=False, default=True)
-    args_parser.add_argument("--cuda",
-                             default=False, action="store_true")
-    args_parser.add_argument("--no-cuda",
-                             dest="cuda", action="store_false")
     args_parser.add_argument("--output",
                              type=str, required=False, default=None)
     args_parser.add_argument("--log",
                              type=str, required=False, default="INFO")
-
-    # Information about the other nodes
-    args_parser.add_argument("--memory-rank",
-                             type=int, required=False)
-    args_parser.add_argument("--ps-rank",
-                             type=int, required=False)
-    args_parser.add_argument("--actors",
-                             action='store', dest='actors', type=int, nargs='+')
-    args_parser.add_argument("--learners",
-                             action='store', dest='learners', type=int, nargs='+')
+    args_parser.add_argument("--annealing",
+                             type=int, default=20_000)
+    args_parser.add_argument("--n-actors", type=int)
+    args_parser.add_argument("--n-learners", type=int)
 
     return args_parser.parse_args()
+
+
+def run_node(
+        rank: int,
+        world_size: int,
+        node_type: Literal["ps", "actor", "learner", "memory"],
+        args: Namespace, *,
+        cuda: bool = False,
+        num_worker_threads: int = 32):
+    global ps
+    global memory_buffer
+    global actor
+    global learner
+
+    device = torch.device("cuda" if cuda else "cpu")
+    if cuda and not torch.cuda.is_available():
+        logger.error(f"CUDA device not available for node_{rank}")
+    elif not cuda and torch.cuda.is_available():
+        device = torch.device("cpu")
+    logger.info(f"using {device.type} device in node_{rank}")
+
+    env = gym.make(args.env)
+
+    action_space_dim = 2
+    observation_shape = 4
+
+    rpc.init_rpc(
+        f"node_{rank}",
+        rank=rank,
+        world_size=world_size,
+        rpc_backend_options=rpc.TensorPipeRpcBackendOptions(num_worker_threads=num_worker_threads, _transports=["uv"])
+    )
+
+    if node_type == "ps":
+        rref_memory = rpc.remote(1, get_memory_buffer)
+        learners = [rpc.remote(remote_id, get_learner) for remote_id in range(2, 2 + args.n_learners)]
+        actors = [
+            rpc.remote(remote_id, get_actor)
+            for remote_id in range(2 + args.n_learners, 2 + args.n_learners + args.n_actors)]
+
+        ps = ParameterServer(
+            DeepQNetwork(observation_shape, action_space_dim),
+            rref_memory,
+            actors,
+            learners,
+            args.learning_rate,
+            args.sync_freq,
+            args.max_version_diff,
+            args.checkpoint
+        )
+
+        target_network = ps.train(args.mem_size, args.steps)
+        if args.output is not None:
+            torch.save(target_network.state_dict(), args.output)
+    elif node_type == "actor":
+        rref_ps = rpc.remote(0, get_ps)
+        rref_memory = rpc.remote(1, get_memory_buffer)
+        # annealer = LinearAnnealer(1.0, 0.1, args.steps)
+        annealer = LinearAnnealer(1.0, 0.1, args.annealing)
+        actor = Actor(
+            rank,
+            env,
+            rref_memory,
+            rref_ps,
+            DeepQNetwork(observation_shape, action_space_dim),
+            annealer,
+            args.sync_freq,
+            device
+        )
+    elif node_type == "learner":
+        rref_ps = rpc.remote(0, get_ps)
+        rref_memory = rpc.remote(1, get_memory_buffer)
+        learner = Learner(
+            rank,
+            DeepQNetwork(observation_shape, action_space_dim),
+            rref_ps,
+            rref_memory,
+            args.batch_size,
+            args.gamma,
+            device
+        )
+    elif node_type == "memory":
+        memory_buffer = MemoryReplay(args.mem_size, (observation_shape, ))
+        logger.debug("memory buffer ready")
+
+    rpc.shutdown()
 
 
 if __name__ == "__main__":
@@ -148,66 +217,32 @@ if __name__ == "__main__":
             level=log_level
         )
 
-    device = torch.device("cuda" if args.cuda else "cpu")
-    if args.cuda and not torch.cuda.is_available():
-        logger.error(f"CUDA device not available for node_{args.rank}")
-    elif not args.cuda and torch.cuda.is_available():
-        device = torch.device("cpu")
-    logger.info(f"using {device.type} device in node_{args.rank}")
-
-    env = gym.make(args.env)
-
-    action_space_dim = 2
-    observation_shape = 4
-
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
-    rpc.init_rpc(f"node_{args.rank}", rank=args.rank, world_size=args.world_size)
 
-    if args.node_type == "ps":
-        ps = ParameterServer(
-            DeepQNetwork(observation_shape, action_space_dim),
-            args.learning_rate,
-            args.sync_freq,
-            args.max_version_diff,
-            args.checkpoint
-        )
-        rref_memory = rpc.remote(args.memory_rank, get_memory_buffer)
-        actors = [rpc.remote(remote_id, get_actor) for remote_id in args.actors]
-        learners = [rpc.remote(remote_id, get_learner) for remote_id in args.learners]
-        coordinator = Coordinator(ps, rref_memory, actors, learners)
+    world_size = 2 + args.n_learners + args.n_actors
+    processes = []
 
-        target_network = coordinator.train(args.mem_size, args.steps)
-        if args.output is not None:
-            torch.save(target_network.state_dict(), args.output)
-    elif args.node_type == "actor":
-        rref_ps = rpc.remote(args.ps_rank, get_ps)
-        rref_memory = rpc.remote(args.memory_rank, get_memory_buffer)
-        annealer = LinearAnnealer(1.0, 0.1, args.steps)
-        actor = Actor(
-            args.rank,
-            env,
-            rref_memory,
-            rref_ps,
-            DeepQNetwork(observation_shape, action_space_dim),
-            annealer,
-            args.sync_freq,
-            device
-        )
-    elif args.node_type == "learner":
-        rref_ps = rpc.remote(args.ps_rank, get_ps)
-        rref_memory = rpc.remote(args.memory_rank, get_memory_buffer)
-        learner = Learner(
-            args.rank,
-            DeepQNetwork(observation_shape, action_space_dim),
-            rref_ps,
-            rref_memory,
-            args.batch_size,
-            args.gamma,
-            device
-        )
-    elif args.node_type == "memory":
-        memory_buffer = MemoryReplay(args.mem_size, (observation_shape, ))
-        logger.debug("memory buffer ready")
+    ps_process = mp.Process(target=run_node, args=(0, world_size, "ps", args), kwargs={"cuda": False})
+    memory_process = mp.Process(target=run_node, args=(1, world_size, "memory", args), kwargs={"cuda": False})
 
-    rpc.shutdown()
+    ps_process.start()
+    memory_process.start()
+
+    processes.append(ps_process)
+    processes.append(memory_process)
+
+    n_processes = len(processes)
+    for i in range(args.n_learners):
+        p = mp.Process(target=run_node, args=(n_processes + i, world_size, "learner", args), kwargs={"cuda": True})
+        p.start()
+        processes.append(p)
+
+    n_processes = len(processes)
+    for i in range(args.n_actors):
+        p = mp.Process(target=run_node, args=(n_processes + i, world_size, "actor", args), kwargs={"cuda": True})
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()

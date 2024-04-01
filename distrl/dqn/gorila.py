@@ -1,7 +1,10 @@
 import copy
+import logging
+import math
 import os
 import random
 import threading
+import time
 from itertools import count
 from math import ceil
 from typing import Any, Optional, Dict, Tuple, List, Union
@@ -13,21 +16,25 @@ from torch import nn, optim
 from torch.distributed import rpc
 
 from distrl.dqn.utils import LinearAnnealer
-import logging
 
 logger = logging.getLogger(__name__)
 
 
-# TODO: add logging option
 class ParameterServer:
     def __init__(self,
                  q_network: nn.Module,
+                 memory_buffer: rpc.RRef,
+                 actors: List[rpc.RRef],
+                 learners: List[rpc.RRef],
                  lr: float,
                  sync_frequency: int,
                  max_version_difference: Optional[int] = None,
                  checkpoint: bool = True):
         self._q_network = q_network
         self._target_network = copy.deepcopy(q_network)
+        self._memory_buffer = memory_buffer
+        self._actors = actors
+        self._learners = learners
         self.__version = 0
         self._optimizer = optim.AdamW(self._q_network.parameters(), lr=lr)
         self._max_version_difference = max_version_difference
@@ -39,6 +46,39 @@ class ParameterServer:
         if self._checkpoint:
             os.makedirs("checkpoints", exist_ok=True)
             logger.info("`checkpoint` dir created")
+
+    def train(self, n_frames_before_training: int, steps_per_learner: int):
+        start = time.time()
+        for learner in self._learners:
+            self.subscribe(learner)
+
+        logger.debug("filling memory buffer")
+        n_frames_before_training = ceil(n_frames_before_training / len(self._actors))
+        async_calls = []
+        for actor in self._actors:
+            async_calls.append(actor.rpc_async(timeout=0).act(n_frames_before_training))
+        for call in async_calls:
+            call.wait()
+
+        async_calls = []
+        logger.debug(f"staring {len(self._learners)} learners. Training for {steps_per_learner} steps")
+        for learner in self._learners:
+            async_calls.append(learner.rpc_async(timeout=0).train(steps_per_learner))
+        logger.debug(f"starting {len(self._actors)} actors.")
+        for actor in self._actors:
+            actor.rpc_async(timeout=0).act()
+        for call in async_calls:
+            call.wait()
+
+        async_calls = []
+        for actor in self._actors:
+            async_calls.append(actor.rpc_async().stop())
+        for call in async_calls:
+            call.wait()
+        end = time.time()
+
+        logger.info(f"end of training after {math.ceil(end - start)} seconds")
+        return self._target_network
 
     def update(self, learner: int, version: int, gradients: Dict[str, torch.Tensor]) -> bool:
         with self.__lock:
@@ -80,11 +120,7 @@ class ParameterServer:
         if self._checkpoint:
             torch.save(state_dict, os.path.join("checkpoints", f"checkpoint-{self.__version}.pth"))
 
-    def result(self) -> nn.Module:
-        return self._target_network
 
-
-# TODO: add logging option
 class Learner:
     def __init__(self,
                  rank_id: int,
@@ -153,7 +189,6 @@ class Learner:
                 break
 
 
-# TODO: add logging option
 class Actor:
     def __init__(self,
                  rank_id: int,
@@ -194,7 +229,7 @@ class Actor:
 
     def stop(self):
         logger.warning(f"stopping actor {self.__rank_id} with version {self.__version}. {self.__n_samples} samples "
-                       f"created.")
+                       f"generated.")
         self.__stop_signal = True
 
     def act(self, n_steps: Optional[int] = None):
@@ -216,56 +251,19 @@ class Actor:
                 )
                 next_state, reward, terminated, truncated, info = self._env.step(action)
                 done = terminated or truncated
-                self._memory_replay.rpc_sync().push(
-                    torch.Tensor(np.array(state)),
-                    action,
-                    reward,
-                    torch.Tensor(np.array(next_state)),
-                    1 * done)
+
+                try:
+                    self._memory_replay.rpc_sync().push(
+                        torch.Tensor(np.array(state)),
+                        action,
+                        reward,
+                        torch.Tensor(np.array(next_state)),
+                        1 * done)
+                except RuntimeError:
+                    logger.error(f"memory buffer disconnected, aborting actor {self.__rank_id} after "
+                                 f"{self.__n_samples} samples")
+                    return
                 state = next_state
 
                 if n_steps is not None and step >= n_steps:
                     return
-
-
-# TODO: merge Coordinator and Parameter Server
-class Coordinator:
-    def __init__(self,
-                 parameter_server: ParameterServer,
-                 memory_buffer: rpc.RRef,
-                 actors: List[rpc.RRef],
-                 learners: List[rpc.RRef]):
-        self._parameter_server = parameter_server
-        self._memory_buffer = memory_buffer
-        self._actors = actors
-        self._learners = learners
-
-    def train(self, n_frames_before_training: int, steps_per_learner: int):
-        for learner in self._learners:
-            self._parameter_server.subscribe(learner)
-
-        logger.debug("filling memory buffer")
-        n_frames_before_training = ceil(n_frames_before_training / len(self._actors))
-        async_calls = []
-        for actor in self._actors:
-            async_calls.append(actor.rpc_async(timeout=0).act(n_frames_before_training))
-        for call in async_calls:
-            call.wait()
-
-        async_calls = []
-        logger.debug(f"staring {len(self._learners)} learners. Training for {steps_per_learner} steps")
-        for learner in self._learners:
-            async_calls.append(learner.rpc_async(timeout=0).train(steps_per_learner))
-        logger.debug(f"starting {len(self._actors)} actors.")
-        for actor in self._actors:
-            actor.rpc_async(timeout=0).act()
-        for call in async_calls:
-            call.wait()
-
-        async_calls = []
-        for actor in self._actors:
-            async_calls.append(actor.rpc_async().stop())
-        for call in async_calls:
-            call.wait()
-
-        return self._parameter_server.result()

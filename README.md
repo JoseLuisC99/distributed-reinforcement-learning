@@ -20,7 +20,7 @@ pip install -e .
 At the moment, only the next models are available:
 
 - [x] Policy-Parameter Server
-- [ ] GORILA
+- [x] GORILA
 - [ ] A3C
 - [ ] IMPALA
 - [ ] Ape-X
