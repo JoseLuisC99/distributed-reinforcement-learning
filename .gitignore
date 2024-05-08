@@ -3,6 +3,7 @@
 distrl.egg-info/
 bibliography
 notebooks/archive
+notebooks/videos
 examples/archive
 models/archive
 __pycache__

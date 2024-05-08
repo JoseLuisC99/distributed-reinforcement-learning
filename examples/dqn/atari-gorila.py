@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Literal
 
 import gymnasium as gym
+from gymnasium.wrappers import AtariPreprocessing, TransformReward, FrameStack
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
@@ -68,16 +69,28 @@ def get_ps(retry: int = 5, max_attempts: int = 4):
 
 
 class DeepQNetwork(nn.Module):
-    def __init__(self, n_observations, n_actions):
-        super(DeepQNetwork, self).__init__()
-        self.layer1 = nn.Linear(n_observations, 128)
-        self.layer2 = nn.Linear(128, 128)
-        self.layer3 = nn.Linear(128, n_actions)
+    def __init__(self, n_actions: int):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(4, 32, 8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, 3, stride=1)
+        self.fc1 = nn.Linear(7 * 7 * 64, 1024)
+        self.fc2 = nn.Linear(1024, n_actions)
+
+        torch.nn.init.kaiming_normal_(self.conv1.weight, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_normal_(self.conv2.weight, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_normal_(self.conv3.weight, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_normal_(self.fc1.weight, nonlinearity='leaky_relu')
+        torch.nn.init.kaiming_normal_(self.fc2.weight, nonlinearity='leaky_relu')
 
     def forward(self, x):
-        x = F.relu(self.layer1(x))
-        x = F.relu(self.layer2(x))
-        return self.layer3(x)
+        x = x.type(torch.float32) / 255.0
+        x = F.leaky_relu(self.conv1(x), 0.01)
+        x = F.leaky_relu(self.conv2(x), 0.01)
+        x = F.leaky_relu(self.conv3(x), 0.01)
+        x = F.leaky_relu(self.fc1(nn.Flatten()(x)), 0.01)
+        return self.fc2(x)
 
 
 def get_arguments() -> Namespace:
@@ -87,21 +100,21 @@ def get_arguments() -> Namespace:
     args_parser.add_argument("--master-port",
                              type=int, default=8080)
     args_parser.add_argument("--env",
-                             type=str, default="CartPole-v1")
+                             type=str, default="ALE/Breakout-v5")
     args_parser.add_argument("--batch-size",
-                             type=int, default=64)
+                             type=int, default=32)
     args_parser.add_argument("--gamma",
                              type=float, default=0.99)
     args_parser.add_argument("--steps",
-                             type=int, default=20_000)
+                             type=int, default=1_000_000)
     args_parser.add_argument("--mem-size",
-                             type=int, default=50_000)
+                             type=int, default=100_000)
     args_parser.add_argument("--learning-rate",
-                             type=float, default=2e-4)
+                             type=float, default=0.00025)
     args_parser.add_argument("--sync-freq",
-                             type=int, default=1_000)
+                             type=int, default=60_000)
     args_parser.add_argument("--max-version-diff",
-                             type=int, default=10)
+                             type=int, default=20)
     args_parser.add_argument("--checkpoint",
                              type=bool, required=False, default=True)
     args_parser.add_argument("--output",
@@ -109,7 +122,7 @@ def get_arguments() -> Namespace:
     args_parser.add_argument("--log",
                              type=str, required=False, default="INFO")
     args_parser.add_argument("--annealing",
-                             type=int, default=20_000)
+                             type=int, default=1_000_000)
     args_parser.add_argument("--n-actors", type=int)
     args_parser.add_argument("--n-learners", type=int)
 
@@ -135,10 +148,13 @@ def run_node(
         device = torch.device("cpu")
     logger.info(f"using {device.type} device in node_{rank}")
 
-    env = gym.make(args.env)
+    env = gym.make(args.env, frameskip=1)
+    env = AtariPreprocessing(env, scale_obs=False)
+    env = FrameStack(env, 4, True)
+    env = TransformReward(env, lambda x: min(max(x, -1.0), 1.0))
 
-    action_space_dim = 2
-    observation_shape = 4
+    action_space_dim = env.action_space.n
+    observation_shape = env.observation_space.shape
 
     rpc.init_rpc(
         f"node_{rank}",
@@ -148,14 +164,15 @@ def run_node(
     )
 
     if node_type == "ps":
+        rref_memory = rpc.remote(1, get_memory_buffer)
         learners = [rpc.remote(remote_id, get_learner) for remote_id in range(2, 2 + args.n_learners)]
         actors = [
             rpc.remote(remote_id, get_actor)
             for remote_id in range(2 + args.n_learners, 2 + args.n_learners + args.n_actors)]
-        annealer = LinearAnnealer(1.0, 0.1, args.annealing)
 
+        annealer = LinearAnnealer(1.0, 0.1, args.annealing)
         ps = ParameterServer(
-            DeepQNetwork(observation_shape, action_space_dim),
+            DeepQNetwork(action_space_dim),
             actors,
             learners,
             args.learning_rate,
@@ -167,18 +184,17 @@ def run_node(
 
         target_network = ps.train(args.mem_size)
         if args.output is not None:
-            torch.save(target_network.state_dict(), os.path.join(args.output, f"cartpole-gorila.pth"))
-            logger.info(f'model saved on {os.path.abspath(os.path.join(args.output, f"cartpole-gorila.pth"))}')
+            torch.save(target_network.state_dict(), os.path.join(args.output, f"atari-gorila.pth"))
+            logger.info(f'model saved on {os.path.abspath(os.path.join(args.output, f"atari-gorila.pth"))}')
     elif node_type == "actor":
         rref_ps = rpc.remote(0, get_ps)
         rref_memory = rpc.remote(1, get_memory_buffer)
-        # annealer = LinearAnnealer(1.0, 0.1, args.steps)
         actor = Actor(
             rank,
             env,
             rref_memory,
             rref_ps,
-            DeepQNetwork(observation_shape, action_space_dim),
+            DeepQNetwork(action_space_dim),
             device
         )
     elif node_type == "learner":
@@ -186,7 +202,7 @@ def run_node(
         rref_memory = rpc.remote(1, get_memory_buffer)
         learner = Learner(
             rank,
-            DeepQNetwork(observation_shape, action_space_dim),
+            DeepQNetwork(action_space_dim),
             rref_ps,
             rref_memory,
             args.batch_size,
@@ -194,7 +210,10 @@ def run_node(
             device
         )
     elif node_type == "memory":
-        memory_buffer = MemoryReplay(args.mem_size, (observation_shape, ), args.steps)
+        memory_buffer = MemoryReplay(
+            args.mem_size, observation_shape, args.steps,
+            obs_dtype=torch.int8, action_dtype=torch.int8, rewards_dtype=torch.int8
+        )
         memory_buffer.subscribe(rpc.remote(0, get_ps))
         logger.debug("memory buffer ready")
 
@@ -221,6 +240,8 @@ if __name__ == "__main__":
 
     world_size = 2 + args.n_learners + args.n_actors
     processes = []
+
+    print("#" * 50)
 
     ps_process = mp.Process(target=run_node, args=(0, world_size, "ps", args), kwargs={"cuda": False})
     memory_process = mp.Process(target=run_node, args=(1, world_size, "memory", args), kwargs={"cuda": False})

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package distributed_rl.a3c;
+
+import "distrl/grpc/tensor.proto";
+
+service Coordinator {
+  rpc PushGradients (ParametersMessage) returns (VersionMessage) {};
+  rpc Synchronize (VersionMessage) returns (ParametersMessage) {};
+}
+
+message VersionMessage {
+  int32 version = 1;
+}
+
+message ParametersMessage {
+  map<string, Tensor> actor = 1;
+  map<string, Tensor> critic = 2;
+  int32 version = 3;
+  optional bool terminated = 4;
+}

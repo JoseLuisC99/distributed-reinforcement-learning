@@ -23,61 +23,58 @@ logger = logging.getLogger(__name__)
 class ParameterServer:
     def __init__(self,
                  q_network: nn.Module,
-                 memory_buffer: rpc.RRef,
                  actors: List[rpc.RRef],
                  learners: List[rpc.RRef],
                  lr: float,
                  sync_frequency: int,
+                 annealer: LinearAnnealer,
                  max_version_difference: Optional[int] = None,
                  checkpoint: bool = True):
         self._q_network = q_network
         self._target_network = copy.deepcopy(q_network)
-        self._memory_buffer = memory_buffer
         self._actors = actors
         self._learners = learners
+        self._annealer = annealer
         self.__version = 0
-        self._optimizer = optim.AdamW(self._q_network.parameters(), lr=lr)
+        self._optimizer = optim.Adam(self._q_network.parameters(), lr=lr, eps=1.5e-4)
         self._max_version_difference = max_version_difference
         self._sync_frequency = sync_frequency
         self._checkpoint = checkpoint
         self.__listeners = []
         self.__lock = threading.Lock()
+        self.__start_time = 0
+        self.__stop_signal = False
 
         if self._checkpoint:
             os.makedirs("checkpoints", exist_ok=True)
             logger.info("`checkpoint` dir created")
 
-    def train(self, n_frames_before_training: int, steps_per_learner: int):
-        start = time.time()
+    def train(self, n_frames_before_training: int):
+        self.__start_time = time.time()
         for learner in self._learners:
             self.subscribe(learner)
+        for actor in self._actors:
+            self.subscribe(actor)
 
-        logger.debug("filling memory buffer")
+        logger.info("filling memory buffer")
         n_frames_before_training = ceil(n_frames_before_training / len(self._actors))
         async_calls = []
         for actor in self._actors:
-            async_calls.append(actor.rpc_async(timeout=0).act(n_frames_before_training))
+            async_calls.append(actor.rpc_async(timeout=0).act(n_steps=n_frames_before_training))
         for call in async_calls:
             call.wait()
 
+        logger.info(f"staring {len(self._learners)} learners")
+        self.sync_target_network()
         async_calls = []
-        logger.debug(f"staring {len(self._learners)} learners. Training for {steps_per_learner} steps")
         for learner in self._learners:
-            async_calls.append(learner.rpc_async(timeout=0).train(steps_per_learner))
+            async_calls.append(learner.rpc_async(timeout=0).train())
         logger.debug(f"starting {len(self._actors)} actors.")
         for actor in self._actors:
-            actor.rpc_async(timeout=0).act()
+            async_calls.append(actor.rpc_async(timeout=0).act(annealer=copy.copy(self._annealer)))
         for call in async_calls:
             call.wait()
 
-        async_calls = []
-        for actor in self._actors:
-            async_calls.append(actor.rpc_async().stop())
-        for call in async_calls:
-            call.wait()
-        end = time.time()
-
-        logger.info(f"end of training after {math.ceil(end - start)} seconds")
         return self._target_network
 
     def update(self, learner: int, version: int, gradients: Dict[str, torch.Tensor]) -> bool:
@@ -105,20 +102,30 @@ class ParameterServer:
             return self.__version, self._q_network.state_dict()
 
     def subscribe(self, rref: rpc.RRef):
-        logger.info(f"New learner added: {rref.owner()}")
+        logger.info(f"New node added: {rref.owner()}")
         self.__listeners.append(rref)
 
     def sync_target_network(self) -> None:
+        version = self.__version
         state_dict = self._q_network.state_dict()
         self._target_network.load_state_dict(state_dict)
         futures = []
         for rref in self.__listeners:
-            futures.append(rref.rpc_async().sync(state_dict))
+            futures.append(rref.rpc_async().sync(state_dict, version))
         for fut in futures:
             fut.wait()
 
         if self._checkpoint:
-            torch.save(state_dict, os.path.join("checkpoints", f"checkpoint-{self.__version}.pth"))
+            torch.save(state_dict, os.path.join("checkpoints", f"checkpoint-{version}.pth"))
+
+    def stop(self):
+        end = time.time()
+        futures = []
+        for rref in self.__listeners:
+            futures.append(rref.rpc_async().stop())
+        for fut in futures:
+            fut.wait()
+        logger.info(f"end of training after {math.ceil(end - self.__start_time)} seconds")
 
 
 class Learner:
@@ -143,20 +150,20 @@ class Learner:
         self.__lock = threading.Lock()
         self.__rank_id = rank_id
 
-    def sync(self, state_dict: Dict[str, Any]):
+    def sync(self, state_dict: Dict[str, Any], version: int):
         with self.__lock:
             self._target_network.load_state_dict(state_dict)
 
     def stop(self):
         logger.warning(f"stopping learner {self.__rank_id} with version {self.__version}")
-        self.__stop_signal = False
+        self.__stop_signal = True
 
-    def train(self, n_steps: int):
-        step = 0
+    def train(self):
         while not self.__stop_signal:
-            version, state_dict = self._parameter_server.rpc_sync().parameters()
-            self._q_network.load_state_dict(state_dict)
-            self.__version = version
+            with self.__lock:
+                version, state_dict = self._parameter_server.rpc_sync().parameters()
+                self._q_network.load_state_dict(state_dict)
+                self.__version = version
             logger.debug(f"loading Q-network on learner {self.__rank_id}: version {self.__version}")
 
             for param in self._q_network.parameters():
@@ -184,9 +191,6 @@ class Learner:
                 gradients[name] = param.grad.data.detach().cpu()
             if not self._parameter_server.rpc_sync().update(self.__rank_id, self.__version, gradients):
                 pass
-            step += 1
-            if step == n_steps:
-                break
 
 
 class Actor:
@@ -196,35 +200,37 @@ class Actor:
                  memory_replay: rpc.RRef,
                  parameter_server: rpc.RRef,
                  q_network: nn.Module,
-                 annealer: LinearAnnealer,
-                 update_frequency: int,
                  device: torch.device = torch.device("cpu")):
         self._env = env
         self._memory_replay = memory_replay
         self._parameter_server = parameter_server
-        self._annealer = annealer
         self._device = device
-        self._update_frequency = update_frequency
         self._q_network = q_network.to(self._device)
         self.__stop_signal = False
+        self._annealer = None
 
         self.__n_samples = 0
         self.__rank_id = rank_id
         self.__version = 0
 
-    def update(self):
-        version, state_dict = self._parameter_server.rpc_sync().parameters()
-        self.__version = version
-        self._q_network.load_state_dict(state_dict)
+        self.__lock = threading.Lock()
+
+    def sync(self, state_dict: Dict[str, Any], version: int):
+        if self._annealer is not None:
+            logger.info(f"Synchronizing actor {self.__rank_id}: current epsilon value "
+                        f"is {self._annealer.current_value} after {self._annealer.current_step} steps")
+        with self.__lock:
+            self._q_network.load_state_dict(state_dict)
+            self.__version = version
 
     def _epsilon_greedy(self, epsilon: float, state: torch.Tensor) -> Any:
         assert 0.0 <= epsilon <= 1.0
-        if random.random() > epsilon:
+        if random.random() < epsilon:
+            action = self._env.action_space.sample()
+        else:
             with torch.no_grad():
                 q_values = self._q_network(state)
                 action = torch.argmax(q_values, dim=1).detach().cpu().item()
-        else:
-            action = self._env.action_space.sample()
         return action
 
     def stop(self):
@@ -232,8 +238,9 @@ class Actor:
                        f"generated.")
         self.__stop_signal = True
 
-    def act(self, n_steps: Optional[int] = None):
+    def act(self, annealer: Optional[LinearAnnealer] = None, n_steps: Optional[int] = None):
         step = 0
+        self._annealer = annealer
         for _ in count():
             state, _ = self._env.reset()
             done = False
@@ -242,12 +249,11 @@ class Actor:
                 self.__n_samples += 1
                 if self.__stop_signal:
                     return
-                if step % self._update_frequency == 0:
-                    self.update()
 
                 step += 1
+                epsilon = 1.0 if self._annealer is None else self._annealer.step()
                 action = self._epsilon_greedy(
-                    self._annealer.step(), torch.Tensor(np.array(state)).unsqueeze(0).to(self._device)
+                    epsilon, torch.Tensor(np.array(state)).unsqueeze(0).to(self._device)
                 )
                 next_state, reward, terminated, truncated, info = self._env.step(action)
                 done = terminated or truncated
@@ -258,7 +264,7 @@ class Actor:
                         action,
                         reward,
                         torch.Tensor(np.array(next_state)),
-                        1 * done)
+                        done)
                 except RuntimeError:
                     logger.error(f"memory buffer disconnected, aborting actor {self.__rank_id} after "
                                  f"{self.__n_samples} samples")

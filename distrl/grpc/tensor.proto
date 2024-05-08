@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package distributed_rl;
+
+enum DataType {
+  DT_INVALID = 0;
+  DT_FLOAT = 1;
+  DT_DOUBLE = 2;
+  DT_INT64 = 3;
+  DT_INT32 = 4;
+  DT_INT16 = 5;
+  DT_INT8 = 6;
+  DT_BOOL = 7;
+}
+
+message TensorShape {
+  message Dim {
+    sint64 size = 1;
+    optional string name = 2;
+  }
+
+  repeated Dim dims = 1;
+}
+
+message Tensor {
+  DataType dtype = 1;
+  TensorShape shape = 2;
+  int32 version = 3;
+
+  bytes data = 4;
+  repeated float float_data = 5 [packed = true];
+  repeated double double_data = 6 [packed = true];
+  repeated int64 int64_data = 7 [packed = true];
+  // For DT_INT32, DT_INT16, DT_INT8
+  repeated int32 int_data = 8 [packed = true];
+  repeated bool bool_data = 9 [packed = true];
+}
